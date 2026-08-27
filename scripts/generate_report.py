@@ -4,6 +4,7 @@ from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import re, time, urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
 
 import feedparser
 import yfinance as yf
@@ -19,12 +20,45 @@ def history(ticker, period="6mo"):
     return float(values[-1]),(float(values[-1])/float(values[-2])-1)*100,[float(x) for x in values[-60:]]
 
 def set_card(soup,label,value,change,fmt="{:,.2f}"):
-    node=next((x for x in soup.select(".label,.macro-card span") if x.get_text(strip=True)==label),None)
-    if not node: return
-    card=node.find_parent(["article"]); val=card.select_one(".value") or card.find("strong")
-    delta=card.select_one(".up,.down,.flat")
-    val.string=fmt.format(value); delta["class"]=["up" if change>0 else "down" if change<0 else "flat"]
-    delta.string=("▲" if change>0 else "▼" if change<0 else "–")+f" {abs(change):.2f}%"
+    nodes=[x for x in soup.select(".label,.macro-card span") if x.get_text(strip=True)==label]
+    for node in nodes:
+        card=node.find_parent(["article"]); val=card.select_one(".value") or card.find("strong")
+        delta=card.select_one(".up,.down,.flat")
+        val.string=fmt.format(value); delta["class"]=["up" if change>0 else "down" if change<0 else "flat"]
+        delta.string=("▲" if change>0 else "▼" if change<0 else "–")+f" {abs(change):.2f}%"
+
+def treasury_yields(year):
+    query=urllib.parse.urlencode({"data":"daily_treasury_yield_curve","field_tdr_date_value":year})
+    request=urllib.request.Request(
+        f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml?{query}",
+        headers={"User-Agent":"us-market-close-report/1.0"},
+    )
+    with urllib.request.urlopen(request,timeout=30) as response:
+        root=ET.fromstring(response.read())
+    ns={"atom":"http://www.w3.org/2005/Atom","m":"http://schemas.microsoft.com/ado/2007/08/dataservices/metadata","d":"http://schemas.microsoft.com/ado/2007/08/dataservices"}
+    rows=[]
+    for entry in root.findall("atom:entry",ns):
+        props=entry.find("atom:content/m:properties",ns)
+        if props is None: continue
+        def value(name):
+            node=props.find(f"d:{name}",ns)
+            return float(node.text) if node is not None and node.text else None
+        date_node=props.find("d:NEW_DATE",ns)
+        if date_node is None or not date_node.text: continue
+        yields={label:value(field) for label,field in {"US 2Y":"BC_2YEAR","US 10Y":"BC_10YEAR","US 30Y":"BC_30YEAR"}.items()}
+        if all(rate is not None for rate in yields.values()): rows.append((date_node.text,yields))
+    if len(rows)<2: raise RuntimeError("미 재무부 수익률 데이터가 부족합니다.")
+    rows.sort(key=lambda row:row[0])
+    previous,current=rows[-2][1],rows[-1][1]
+    return {label:(rate,(rate-previous[label])*100) for label,rate in current.items()}
+
+def set_yield_card(soup,label,value,change_bp):
+    nodes=[x for x in soup.select(".macro-card span") if x.get_text(strip=True)==label]
+    for node in nodes:
+        card=node.find_parent("article"); card.find("strong").string=f"{value:.2f}%"
+        delta=card.select_one(".up,.down,.flat")
+        delta["class"]=["up" if change_bp>0 else "down" if change_bp<0 else "flat"]
+        delta.string=("▲" if change_bp>0 else "▼" if change_bp<0 else "–")+f" {abs(change_bp):.1f}bp"
 
 def replace_stock(soup,ticker,change):
     marker=soup.find("small",string=re.compile(rf"\b{re.escape(ticker)}\b"))
@@ -66,6 +100,8 @@ def main():
     for label,(ticker,fmt) in macro.items():
         try: value,change,_=history(ticker,"10d"); set_card(soup,label,value,change,fmt)
         except Exception as exc: print(f"{label}: {exc}")
+    yields=treasury_yields(now.year)
+    for label,(value,change_bp) in yields.items(): set_yield_card(soup,label,value,change_bp)
     stocks={"AAPL":"AAPL","MSFT":"MSFT","GOOGL":"GOOGL","AMZN":"AMZN","NVDA":"NVDA","META":"META","TSLA":"TSLA","IONQ":"IONQ","QNT":"QNT","INFQ":"INFQ","RKLB":"RKLB","RDW":"RDW","ASTS":"ASTS"}
     for code,ticker in stocks.items():
         try: _,change,_=history(ticker,"10d"); replace_stock(soup,code,change)
@@ -79,7 +115,8 @@ def main():
     except Exception as exc: print(f"뉴스 조회 실패: {exc}")
     meta=soup.select_one("header .meta"); meta.string=now.strftime("%Y.%m.%d %H:%M KST")
     sp=snapshots.get("S&P 500")
-    summary=(f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). 주요 지수·매크로·뉴스를 확인하세요." if sp else "미국 증시 장마감 리포트가 업데이트되었습니다. 주요 지수·매크로·뉴스를 확인하세요.")
+    rates=f"미 국채 10년 {yields['US 10Y'][0]:.2f}%, 30년 {yields['US 30Y'][0]:.2f}%."
+    summary=(f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). {rates}" if sp else f"미국 증시 장마감 리포트가 업데이트되었습니다. {rates}")
     OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(str(soup),encoding="utf-8"); print(summary)
 
 if __name__=="__main__": main()
