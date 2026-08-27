@@ -55,7 +55,13 @@ def main():
     now=datetime.now(KST); soup=BeautifulSoup(TEMPLATE.read_text(encoding="utf-8"),"html.parser")
     index_map={"S&P 500":"^GSPC","NASDAQ":"^IXIC","DOW JONES":"^DJI"}; series={}; snapshots={}
     for label,ticker in index_map.items():
-        value,change,points=history(ticker); snapshots[label]=(value,change); series[{"S&P 500":"spx","NASDAQ":"nasdaq","DOW JONES":"dow"}[label]]=points; set_card(soup,label,value,change)
+        try:
+            value,change,points=history(ticker)
+            snapshots[label]=(value,change)
+            series[{"S&P 500":"spx","NASDAQ":"nasdaq","DOW JONES":"dow"}[label]]=points
+            set_card(soup,label,value,change)
+        except Exception as exc:
+            print(f"{label}: {exc}")
     macro={"GOLD · 금":("GC=F","${:,.2f}"),"BITCOIN":("BTC-USD","${:,.0f}"),"DOLLAR INDEX":("DX-Y.NYB","{:,.2f}"),"USD / KRW":("KRW=X","₩{:,.2f}"),"WTI":("CL=F","${:,.2f}"),"BRENT":("BZ=F","${:,.2f}"),"VIX":("^VIX","{:,.2f}")}
     for label,(ticker,fmt) in macro.items():
         try: value,change,_=history(ticker,"10d"); set_card(soup,label,value,change,fmt)
@@ -72,7 +78,8 @@ def main():
     try: feed.clear(); feed.append(BeautifulSoup(news_html(),"html.parser"))
     except Exception as exc: print(f"뉴스 조회 실패: {exc}")
     meta=soup.select_one("header .meta"); meta.string=now.strftime("%Y.%m.%d %H:%M KST")
-    sp=snapshots["S&P 500"]; summary=f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). 주요 지수·매크로·뉴스를 확인하세요."
+    sp=snapshots.get("S&P 500")
+    summary=(f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). 주요 지수·매크로·뉴스를 확인하세요." if sp else "미국 증시 장마감 리포트가 업데이트되었습니다. 주요 지수·매크로·뉴스를 확인하세요.")
     OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(str(soup),encoding="utf-8"); print(summary)
 
 if __name__=="__main__": main()
