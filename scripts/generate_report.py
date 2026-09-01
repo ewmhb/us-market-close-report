@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from email.utils import parsedate_to_datetime
 from html import escape
 from io import StringIO
@@ -10,11 +10,15 @@ import xml.etree.ElementTree as ET
 import feedparser, pandas as pd, yfinance as yf
 from bs4 import BeautifulSoup
 
-KST=ZoneInfo("Asia/Seoul"); TEMPLATE=Path("report-template.html"); OUT=Path("site/index.html")
+KST=ZoneInfo("Asia/Seoul"); NY_TZ=ZoneInfo("America/New_York"); TEMPLATE=Path("report-template.html"); OUT=Path("site/index.html")
 NEWS_CACHE=Path("work/news-cache.json")
 NEWS_TIMEOUT=int(os.getenv("NEWS_TIMEOUT_SECONDS","15")); NEWS_ATTEMPTS=int(os.getenv("NEWS_ATTEMPTS","3"))
 NEWS_QUERIES=[("macro","매크로","US economy inflation GDP dollar markets"),("geo","지정학","geopolitics oil market"),("fed","연준","Federal Reserve rates markets"),("market","마켓","Wall Street S&P Nasdaq Dow close")]
 OFFICIAL_FEEDS=[("fed","연준","https://www.federalreserve.gov/feeds/press_all.xml")]
+MAG7={"AAPL":"Apple","MSFT":"Microsoft","GOOGL":"Alphabet","AMZN":"Amazon","NVDA":"NVIDIA","META":"Meta","TSLA":"Tesla"}
+FOMC_DATES={2026:[(1,28),(3,18),(4,29),(6,17),(7,29),(9,16),(10,28),(12,9)],2027:[(1,27),(3,17),(4,28),(6,9),(7,28),(9,15),(10,27),(12,8)]}
+BLS_FALLBACK_2026=[(9,1,10,0,"구인·이직보고서(JOLTS)"),(9,3,8,30,"생산성·단위노동비용"),(9,4,8,30,"고용보고서(비농업 고용·실업률)"),(9,10,8,30,"생산자물가지수(PPI)"),(9,11,8,30,"소비자물가지수(CPI)"),(9,29,10,0,"구인·이직보고서(JOLTS)"),(10,2,8,30,"고용보고서(비농업 고용·실업률)"),(10,14,8,30,"소비자물가지수(CPI)"),(10,15,8,30,"생산자물가지수(PPI)"),(10,30,8,30,"고용비용지수(ECI)")]
+ADP_FALLBACK_2026=[(9,2),(9,30),(11,4),(12,2)]
 
 def close(ticker,period="6mo"):
     f=yf.download(ticker,period=period,progress=False,auto_adjust=False)
@@ -74,12 +78,103 @@ def sp500_breadth():
     req=urllib.request.Request("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",headers={"User-Agent":"us-market-close-report/2.0"})
     with urllib.request.urlopen(req,timeout=30) as r: tickers=pd.read_html(StringIO(r.read().decode("utf-8")))[0]["Symbol"].astype(str).str.replace(".","-",regex=False).tolist()
     f=yf.download(tickers,period="1y",progress=False,auto_adjust=False,threads=True); c=f["Close"].ffill(); last,prev=c.iloc[-1],c.iloc[-2]; valid=last.notna()&prev.notna(); daily=last[valid]/prev[valid]-1
-    ma50=c.rolling(50).mean().iloc[-1]; hi=c.rolling(252,min_periods=200).max().iloc[-1]
-    return {"adv":int((daily>0).sum()),"dec":int((daily<0).sum()),"total":int(valid.sum()),"above50":float((last[valid]>ma50[valid]).mean()*100),"highs":int((last[valid]>=hi[valid]*.999999).sum())}
+    ma20=c.rolling(20).mean().iloc[-1]; ma50=c.rolling(50).mean().iloc[-1]; ma200=c.rolling(200).mean().iloc[-1]; hi=c.rolling(252,min_periods=200).max().iloc[-1]
+    return {"adv":int((daily>0).sum()),"dec":int((daily<0).sum()),"total":int(valid.sum()),"above20":float((last[valid]>ma20[valid]).mean()*100),"above50":float((last[valid]>ma50[valid]).mean()*100),"above200":float((last[valid]>ma200[valid]).mean()*100),"highs":int((last[valid]>=hi[valid]*.999999).sum())}
 
 def rsi(s,n=14):
     d=s.diff(); g=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean(); l=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
     return float((100-100/(1+g/l.replace(0,math.nan))).iloc[-1])
+
+def macd(s):
+    line=s.ewm(span=12,adjust=False).mean()-s.ewm(span=26,adjust=False).mean(); signal=line.ewm(span=9,adjust=False).mean(); hist=line-signal
+    return float(line.iloc[-1]),float(signal.iloc[-1]),float(hist.iloc[-1]),float(hist.iloc[-2])
+
+def fetch_text(url,timeout=20):
+    req=urllib.request.Request(url,headers={"User-Agent":"us-market-close-report/2.1 (+https://github.com/ewmhb/us-market-close-report)"})
+    with urllib.request.urlopen(req,timeout=timeout) as response: return response.read().decode("utf-8","replace")
+
+def bls_events(start,end):
+    events=[]
+    try:
+        raw=fetch_text("https://www.bls.gov/schedule/news_release/bls.ics"); lines=[]
+        for line in raw.replace("\r\n","\n").split("\n"):
+            if line.startswith((" ","\t")) and lines: lines[-1]+=line[1:]
+            else: lines.append(line)
+        current=None
+        for line in lines:
+            if line=="BEGIN:VEVENT": current={}
+            elif line=="END:VEVENT" and current:
+                summary=current.get("SUMMARY",""); raw_date=current.get("DTSTART","")
+                try:
+                    if raw_date.endswith("Z"): when=datetime.strptime(raw_date,"%Y%m%dT%H%M%SZ").replace(tzinfo=ZoneInfo("UTC")).astimezone(NY_TZ)
+                    elif "T" in raw_date: when=datetime.strptime(raw_date[:15],"%Y%m%dT%H%M%S").replace(tzinfo=NY_TZ)
+                    else: when=datetime.combine(datetime.strptime(raw_date[:8],"%Y%m%d").date(),dt_time(8,30),NY_TZ)
+                    if start<=when.date()<=end:
+                        labels={"Employment Situation":"고용보고서(비농업 고용·실업률)","Consumer Price Index":"소비자물가지수(CPI)","Producer Price Index":"생산자물가지수(PPI)","Job Openings and Labor Turnover Survey":"구인·이직보고서(JOLTS)","Productivity and Costs":"생산성·단위노동비용","Employment Cost Index":"고용비용지수(ECI)"}
+                        label=next((ko for en,ko in labels.items() if en in summary),None)
+                        if label: events.append({"when":when,"title":label,"source":"BLS","impact":"금리·달러·주식 변동성"})
+                except Exception: pass
+                current=None
+            elif current is not None and ":" in line:
+                key,value=line.split(":",1); current[key.split(";",1)[0]]=value.replace("\\,",",")
+    except Exception as exc: print(f"CALENDAR_WARNING source='BLS' error={type(exc).__name__}: {exc}")
+    if not events and start.year==2026:
+        for month,day,hour,minute,title in BLS_FALLBACK_2026:
+            d=date(2026,month,day)
+            if start<=d<=end: events.append({"when":datetime.combine(d,dt_time(hour,minute),NY_TZ),"title":title,"source":"BLS 공식 일정(내장 백업)","impact":"금리·달러·주식 변동성"})
+    return events
+
+def adp_events(start,end):
+    events=[]
+    try:
+        text=BeautifulSoup(fetch_text("https://adpemploymentreport.com/"),"html.parser").get_text(" ",strip=True)
+        block=text.split("Upcoming Reports:",1)[1].split("Upcoming reports (weekly",1)[0]
+        for month,day,year in re.findall(r"([A-Z][a-z]+)\s+(\d{1,2}),\s+(\d{4})",block):
+            d=datetime.strptime(f"{month} {day} {year}","%B %d %Y").date()
+            if start<=d<=end: events.append({"when":datetime.combine(d,dt_time(8,15),NY_TZ),"title":"ADP 민간고용","source":"ADP","impact":"고용보고서 사전 심리"})
+    except Exception as exc: print(f"CALENDAR_WARNING source='ADP' error={type(exc).__name__}: {exc}")
+    if not events and start.year==2026:
+        for month,day in ADP_FALLBACK_2026:
+            d=date(2026,month,day)
+            if start<=d<=end: events.append({"when":datetime.combine(d,dt_time(8,15),NY_TZ),"title":"ADP 민간고용","source":"ADP 공식 일정(내장 백업)","impact":"고용보고서 사전 심리"})
+    return events
+
+def fomc_events(start,end):
+    events=[]
+    for year in range(start.year,end.year+1):
+        for month,day in FOMC_DATES.get(year,[]):
+            d=date(year,month,day)
+            if start<=d<=end: events.append({"when":datetime.combine(d,dt_time(14),NY_TZ),"title":"FOMC 금리결정·파월 기자회견","source":"Federal Reserve","impact":"금리·달러·성장주"})
+    return events
+
+def earnings_date(ticker):
+    try:
+        calendar=yf.Ticker(ticker).calendar
+        value=calendar.get("Earnings Date") if isinstance(calendar,dict) else None
+        if value is None and hasattr(calendar,"loc") and "Earnings Date" in calendar.index: value=calendar.loc["Earnings Date"].iloc[0]
+        if isinstance(value,(list,tuple)): value=value[0] if value else None
+        if hasattr(value,"to_pydatetime"): value=value.to_pydatetime()
+        if isinstance(value,datetime): return value.date()
+        if isinstance(value,date): return value
+    except Exception as exc: print(f"CALENDAR_WARNING source={ticker!r} error={type(exc).__name__}: {exc}")
+    return None
+
+def render_weekly_calendar(soup,now):
+    today=now.astimezone(NY_TZ).date(); start=today-timedelta(days=today.weekday()); end=start+timedelta(days=6)
+    events=bls_events(start,end)+adp_events(start,end)+fomc_events(start,end)
+    earnings=[]
+    for ticker,name in MAG7.items():
+        d=earnings_date(ticker)
+        if d: earnings.append((d,ticker,name))
+        if d and start<=d<=end: events.append({"when":datetime.combine(d,dt_time(16),NY_TZ),"title":f"{name}({ticker}) 실적발표 예정","source":"기업 일정","impact":"빅테크·지수 영향"})
+    events.sort(key=lambda x:x["when"]); days="월화수목금토일"
+    rows="".join(f'<li class="row"><span><b>{e["when"].month}/{e["when"].day}({days[e["when"].weekday()]}) {e["when"].strftime("%H:%M")} ET</b><br><small class="note">{escape(e["source"])} · {escape(e["impact"])}</small></span><strong>{escape(e["title"])}</strong></li>' for e in events)
+    if not rows: rows='<li class="note">이번 주에 확인된 핵심 미국 경제지표·FOMC·매그니피센트 7 실적 일정이 없습니다.</li>'
+    n=soup.select_one("#weekly-events"); n.clear(); n.append(BeautifulSoup(rows,"html.parser")); soup.select_one("#weekly-range").string=f'{start.strftime("%Y.%m.%d")}–{end.strftime("%m.%d")} · 미국 동부시간(ET) 기준'
+    upcoming=sorted(x for x in earnings if x[0]>=today)
+    erows="".join(f'<li class="row"><span>{name} <small class="note">{ticker}</small></span><b>{d.month}/{d.day} 예정</b></li>' for d,ticker,name in upcoming)
+    if not erows: erows='<li class="note">현재 데이터 공급자가 확인한 향후 실적 예정일이 없습니다.</li>'
+    n=soup.select_one("#earnings-calendar"); n.clear(); n.append(BeautifulSoup(erows,"html.parser"))
 
 def fetch_rss(key,label,url,name,limit=2):
     error="unknown error"
@@ -171,12 +266,16 @@ def main():
     br=sp500_breadth(); n=soup.select_one("#market-temperature"); n.clear(); n.append(BeautifulSoup(f'<li class="row"><span>상승 / 하락</span><b><span class="up">{br["adv"]}</span> / <span class="down">{br["dec"]}</span></b></li><li class="row"><span>50일선 상회</span><b>{br["above50"]:.1f}%</b></li><li class="row"><span>52주 신고가</span><b>{br["highs"]}</b></li><li class="row"><span>유효 구성종목</span><b>{br["total"]}</b></li>',"html.parser"))
     sp,nas=indices["S&P 500"],indices["NASDAQ"]; lead=("장기금리와 달러가 함께 낮아지며 기술주에 우호적인 위험선호 환경이 형성됐습니다." if nas[1]>0 and yields["US 10Y"][1]<0 and macro["DOLLAR INDEX"][1]<0 else "금리와 달러의 동반 상승이 주식 밸류에이션을 압박한 위험회피 장세였습니다." if sp[1]<0 and yields["US 10Y"][1]>0 and macro["DOLLAR INDEX"][1]>0 else "미국 증시는 상승 마감했지만 금리·달러 흐름을 함께 확인해야 하는 장세였습니다." if sp[1]>0 else "미국 증시는 하락 마감해 위험선호가 약해졌습니다.")
     detail=f'S&P 500 {sp[1]:+.2f}%, 나스닥 {nas[1]:+.2f}%, 10년물 {yields["US 10Y"][1]:+.1f}bp, DXY {macro["DOLLAR INDEX"][1]:+.2f}%, VIX {macro["VIX"][1]:+.2f}%. 상승 종목 비중은 {br["adv"]/br["total"]*100:.1f}%입니다.'; n=soup.select_one("#daily-summary"); n.clear(); n.append(BeautifulSoup(f'<strong>{lead}</strong> {detail}',"html.parser")); soup.select_one("#sample-warning").decompose()
-    sp20=float(sp[2].rolling(20).mean().iloc[-1]); nrsi=rsi(nas[2]); n=soup.select_one("#technical-list"); n.clear(); n.append(BeautifulSoup(f'<li class="row"><span>S&P 500 · 20일선</span><b>{"상회" if sp[0]>sp20 else "하회"} ({sp20:,.0f})</b></li><li class="row"><span>NASDAQ · RSI (14)</span><b>{nrsi:.1f}</b></li><li class="row"><span>VIX</span><b>{macro["VIX"][0]:.2f}</b></li>',"html.parser"))
+    sp_tech=close("^GSPC","1y"); nas_tech=close("^IXIC","1y"); sp20=float(sp_tech.rolling(20).mean().iloc[-1]); sp50=float(sp_tech.rolling(50).mean().iloc[-1]); sp200=float(sp_tech.rolling(200).mean().iloc[-1]); nrsi=rsi(nas_tech); _,_,mh,mh_prev=macd(nas_tech); rv20=float(sp_tech.pct_change().tail(20).std()*math.sqrt(252)*100); high52=float(sp_tech.tail(252).max()); drawdown=(sp[0]/high52-1)*100
+    trend="정배열" if sp[0]>sp20>sp50>sp200 else "역배열" if sp[0]<sp20<sp50<sp200 else "혼조"; macd_text="상승 강화" if mh>0 and mh>mh_prev else "상승 둔화" if mh>0 else "하락 완화" if mh>mh_prev else "하락 강화"
+    score=sum([sp[0]>sp20,sp[0]>sp50,sp[0]>sp200,45<=nrsi<=70,mh>0,br["above50"]>=50,macro["VIX"][0]<20]); regime="상승 추세" if score>=6 else "조정 경계" if score<=2 else "중립·방향 확인"
+    technical_html=f'<li class="row"><span>S&P 500 · 추세 배열</span><b>{trend} · 20/50/200일 {sp20:,.0f}/{sp50:,.0f}/{sp200:,.0f}</b></li><li class="row"><span>S&P 500 · 50일선 괴리</span><b>{(sp[0]/sp50-1)*100:+.2f}%</b></li><li class="row"><span>NASDAQ · RSI(14)</span><b>{nrsi:.1f} · {"과매수" if nrsi>=70 else "과매도" if nrsi<=30 else "중립"}</b></li><li class="row"><span>NASDAQ · MACD</span><b>{macd_text} · 히스토그램 {mh:+.1f}</b></li><li class="row"><span>S&P 시장 폭</span><b>20일 {br["above20"]:.1f}% · 50일 {br["above50"]:.1f}% · 200일 {br["above200"]:.1f}%</b></li><li class="row"><span>변동성·고점 위치</span><b>VIX {macro["VIX"][0]:.2f} · 실현변동성 {rv20:.1f}% · 52주 고점 대비 {drawdown:.1f}%</b></li><li class="row"><span>종합 기술 신호</span><strong class="{cls(score-4)}">{regime} ({score}/7)</strong></li>'
+    n=soup.select_one("#technical-list"); n.clear(); n.append(BeautifulSoup(technical_html,"html.parser"))
     script=soup.find("script",string=re.compile("const chartSeries")); script.string=re.sub(r"const chartSeries=\{.*?\};","const chartSeries="+json.dumps(series)+";",script.string,flags=re.S)
     news,news_quality=collect_news(); feed=soup.select_one(".news-feed"); feed.clear(); feed.append(BeautifulSoup(render_news(news),"html.parser"))
     if news_quality["errors"]: failures.extend(news_quality["errors"])
-    news_status=f'뉴스 {len(news)}건 · 소스 성공 {news_quality["sources_ok"]}/{news_quality["sources_total"]}'+(' · 최근 정상 캐시 사용' if news_quality["cached"] else '')
-    soup.select_one("header .meta").string=now.strftime("%Y.%m.%d %H:%M KST"); n=soup.select_one("#data-quality"); n.clear(); price_date=sp[2].index[-1].date(); n.append(BeautifulSoup(f'<li><b>가격 기준일</b><div class="note">미국 정규장 {price_date} 종가 · Yahoo Finance</div></li><li><b>국채 기준일</b><div class="note">{treasury_date} · U.S. Treasury</div></li><li><b>TGA 기준일</b><div class="note">{tga_date or "조회 실패"} · U.S. Treasury Fiscal Data (일간)</div></li><li><b>뉴스 수집</b><div class="note">{news_status}</div></li><li><b>정합성 검사</b><div class="note">핵심지수 3개·매크로 7개·S&P 구성종목 {br["total"]}개 · 보조 오류 {len(failures)}건</div></li>',"html.parser"))
+    render_weekly_calendar(soup,now)
+    soup.select_one("header .meta").string=now.strftime("%Y.%m.%d %H:%M KST")
     OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(str(soup),encoding="utf-8"); print(f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). {lead}")
 
 if __name__=="__main__": main()
