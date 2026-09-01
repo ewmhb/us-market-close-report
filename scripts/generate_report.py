@@ -1,16 +1,20 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html import escape
 from io import StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
-import json, math, re, time, urllib.parse, urllib.request
+import json, math, os, re, time, urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
 import feedparser, pandas as pd, yfinance as yf
 from bs4 import BeautifulSoup
 
 KST=ZoneInfo("Asia/Seoul"); TEMPLATE=Path("report-template.html"); OUT=Path("site/index.html")
+NEWS_CACHE=Path("work/news-cache.json")
+NEWS_TIMEOUT=int(os.getenv("NEWS_TIMEOUT_SECONDS","15")); NEWS_ATTEMPTS=int(os.getenv("NEWS_ATTEMPTS","3"))
+NEWS_QUERIES=[("macro","매크로","US economy inflation GDP dollar markets"),("geo","지정학","geopolitics oil market"),("fed","연준","Federal Reserve rates markets"),("market","마켓","Wall Street S&P Nasdaq Dow close")]
+OFFICIAL_FEEDS=[("fed","연준","https://www.federalreserve.gov/feeds/press_all.xml")]
 
 def close(ticker,period="6mo"):
     f=yf.download(ticker,period=period,progress=False,auto_adjust=False)
@@ -77,13 +81,66 @@ def rsi(s,n=14):
     d=s.diff(); g=d.clip(lower=0).ewm(alpha=1/n,adjust=False).mean(); l=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False).mean()
     return float((100-100/(1+g/l.replace(0,math.nan))).iloc[-1])
 
-def rss(key,label,query):
-    url=f'https://news.google.com/rss/search?q={urllib.parse.quote(query+" when:1d")}&hl=en-US&gl=US&ceid=US:en&_={int(time.time())}'; out=[]
-    for e in feedparser.parse(url).entries[:2]:
-        try: stamp=parsedate_to_datetime(e.published).astimezone(KST).strftime("%m월 %d일 %H:%M")
+def fetch_rss(key,label,url,name,limit=2):
+    error="unknown error"
+    for attempt in range(1,NEWS_ATTEMPTS+1):
+        try:
+            req=urllib.request.Request(url,headers={"User-Agent":"us-market-close-report/2.1 (+https://github.com/ewmhb/us-market-close-report)","Accept":"application/rss+xml, application/xml;q=0.9, */*;q=0.1"})
+            with urllib.request.urlopen(req,timeout=NEWS_TIMEOUT) as response:
+                status=getattr(response,"status",200); body=response.read()
+            if status!=200: raise RuntimeError(f"HTTP {status}")
+            parsed=feedparser.parse(body)
+            if parsed.bozo and not parsed.entries: raise RuntimeError(f"RSS parse error: {parsed.bozo_exception}")
+            items=[]
+            for entry in parsed.entries[:limit]:
+                published=getattr(entry,"published","")
+                try: published_iso=parsedate_to_datetime(published).astimezone(KST).isoformat()
+                except Exception: published_iso=datetime.now(KST).isoformat()
+                source=getattr(getattr(entry,"source",None),"title",name)
+                title=re.sub(r"\s+-\s+[^-]+$","",getattr(entry,"title","")).strip()
+                link=getattr(entry,"link",url)
+                if title: items.append({"category":key,"label":label,"source":source,"published":published_iso,"title":title,"link":link})
+            print(f"NEWS source={name!r} status={status} entries={len(items)} attempt={attempt}")
+            return items,None
+        except Exception as exc:
+            error=f"{type(exc).__name__}: {exc}"
+            print(f"NEWS_WARNING source={name!r} attempt={attempt}/{NEWS_ATTEMPTS} error={error}")
+            if attempt<NEWS_ATTEMPTS: time.sleep(2**(attempt-1))
+    return [],f"{name}: {error}"
+
+def collect_news():
+    items=[]; errors=[]; source_success=0
+    for key,label,query in NEWS_QUERIES:
+        url=f'https://news.google.com/rss/search?q={urllib.parse.quote(query+" when:1d")}&hl=en-US&gl=US&ceid=US:en'
+        found,error=fetch_rss(key,label,url,f"Google News/{key}")
+        items.extend(found); errors.extend([error] if error else []); source_success+=bool(found)
+    if not items:
+        for key,label,url in OFFICIAL_FEEDS:
+            found,error=fetch_rss(key,label,url,"Federal Reserve",limit=4)
+            cutoff=datetime.now(KST)-timedelta(days=2)
+            found=[x for x in found if datetime.fromisoformat(x["published"])>=cutoff]
+            items.extend(found); errors.extend([error] if error else []); source_success+=bool(found)
+    deduped=[]; seen=set()
+    for item in items:
+        key=re.sub(r"\W+","",item["title"].lower())
+        if key and key not in seen: seen.add(key); deduped.append(item)
+    if deduped:
+        NEWS_CACHE.parent.mkdir(parents=True,exist_ok=True)
+        NEWS_CACHE.write_text(json.dumps({"saved_at":datetime.now(KST).isoformat(),"items":deduped},ensure_ascii=False,indent=2),encoding="utf-8")
+        return deduped,{"sources_ok":source_success,"sources_total":len(NEWS_QUERIES),"cached":False,"errors":errors}
+    if NEWS_CACHE.exists():
+        cached=json.loads(NEWS_CACHE.read_text(encoding="utf-8")); age=datetime.now(KST)-datetime.fromisoformat(cached["saved_at"])
+        if age<=timedelta(hours=48) and cached.get("items"):
+            print(f"NEWS_WARNING using_cache=true age_hours={age.total_seconds()/3600:.1f} entries={len(cached['items'])}")
+            return cached["items"],{"sources_ok":0,"sources_total":len(NEWS_QUERIES),"cached":True,"errors":errors}
+    raise RuntimeError("뉴스 수집 결과가 0건이며 48시간 이내 정상 캐시도 없습니다: "+"; ".join(errors or ["all feeds returned zero entries"]))
+
+def render_news(items):
+    out=[]
+    for item in items:
+        try: stamp=datetime.fromisoformat(item["published"]).astimezone(KST).strftime("%m월 %d일 %H:%M")
         except Exception: stamp="최근"
-        source=getattr(getattr(e,"source",None),"title","Google News"); title=re.sub(r"\s+-\s+[^-]+$","",e.title).strip()
-        out.append(f'<article class="news-item" data-news-category="{key}"><div class="news-source"><strong>{escape(source)}</strong><span>{stamp}</span><b class="news-category">{label}</b></div><a class="news-title" href="{escape(e.link)}" target="_blank" rel="noreferrer">{escape(title)}</a><a class="news-open" href="{escape(e.link)}" target="_blank" rel="noreferrer">↗</a></article>')
+        out.append(f'<article class="news-item" data-news-category="{escape(item["category"])}"><div class="news-source"><strong>{escape(item["source"])}</strong><span>{stamp}</span><b class="news-category">{escape(item["label"])}</b></div><a class="news-title" href="{escape(item["link"])}" target="_blank" rel="noreferrer">{escape(item["title"])}</a><a class="news-open" href="{escape(item["link"])}" target="_blank" rel="noreferrer">↗</a></article>')
     return "".join(out)
 
 def main():
@@ -116,8 +173,10 @@ def main():
     detail=f'S&P 500 {sp[1]:+.2f}%, 나스닥 {nas[1]:+.2f}%, 10년물 {yields["US 10Y"][1]:+.1f}bp, DXY {macro["DOLLAR INDEX"][1]:+.2f}%, VIX {macro["VIX"][1]:+.2f}%. 상승 종목 비중은 {br["adv"]/br["total"]*100:.1f}%입니다.'; n=soup.select_one("#daily-summary"); n.clear(); n.append(BeautifulSoup(f'<strong>{lead}</strong> {detail}',"html.parser")); soup.select_one("#sample-warning").decompose()
     sp20=float(sp[2].rolling(20).mean().iloc[-1]); nrsi=rsi(nas[2]); n=soup.select_one("#technical-list"); n.clear(); n.append(BeautifulSoup(f'<li class="row"><span>S&P 500 · 20일선</span><b>{"상회" if sp[0]>sp20 else "하회"} ({sp20:,.0f})</b></li><li class="row"><span>NASDAQ · RSI (14)</span><b>{nrsi:.1f}</b></li><li class="row"><span>VIX</span><b>{macro["VIX"][0]:.2f}</b></li>',"html.parser"))
     script=soup.find("script",string=re.compile("const chartSeries")); script.string=re.sub(r"const chartSeries=\{.*?\};","const chartSeries="+json.dumps(series)+";",script.string,flags=re.S)
-    feed=soup.select_one(".news-feed"); feed.clear(); feed.append(BeautifulSoup("".join(rss(*g) for g in [("macro","매크로","US economy inflation GDP dollar markets"),("geo","지정학","geopolitics oil market"),("fed","연준","Federal Reserve rates markets"),("market","마켓","Wall Street S&P Nasdaq Dow close")]),"html.parser"))
-    soup.select_one("header .meta").string=now.strftime("%Y.%m.%d %H:%M KST"); n=soup.select_one("#data-quality"); n.clear(); price_date=sp[2].index[-1].date(); n.append(BeautifulSoup(f'<li><b>가격 기준일</b><div class="note">미국 정규장 {price_date} 종가 · Yahoo Finance</div></li><li><b>국채 기준일</b><div class="note">{treasury_date} · U.S. Treasury</div></li><li><b>TGA 기준일</b><div class="note">{tga_date or "조회 실패"} · U.S. Treasury Fiscal Data (일간)</div></li><li><b>정합성 검사</b><div class="note">핵심지수 3개·매크로 7개·S&P 구성종목 {br["total"]}개 · 보조 오류 {len(failures)}건</div></li>',"html.parser"))
+    news,news_quality=collect_news(); feed=soup.select_one(".news-feed"); feed.clear(); feed.append(BeautifulSoup(render_news(news),"html.parser"))
+    if news_quality["errors"]: failures.extend(news_quality["errors"])
+    news_status=f'뉴스 {len(news)}건 · 소스 성공 {news_quality["sources_ok"]}/{news_quality["sources_total"]}'+(' · 최근 정상 캐시 사용' if news_quality["cached"] else '')
+    soup.select_one("header .meta").string=now.strftime("%Y.%m.%d %H:%M KST"); n=soup.select_one("#data-quality"); n.clear(); price_date=sp[2].index[-1].date(); n.append(BeautifulSoup(f'<li><b>가격 기준일</b><div class="note">미국 정규장 {price_date} 종가 · Yahoo Finance</div></li><li><b>국채 기준일</b><div class="note">{treasury_date} · U.S. Treasury</div></li><li><b>TGA 기준일</b><div class="note">{tga_date or "조회 실패"} · U.S. Treasury Fiscal Data (일간)</div></li><li><b>뉴스 수집</b><div class="note">{news_status}</div></li><li><b>정합성 검사</b><div class="note">핵심지수 3개·매크로 7개·S&P 구성종목 {br["total"]}개 · 보조 오류 {len(failures)}건</div></li>',"html.parser"))
     OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(str(soup),encoding="utf-8"); print(f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). {lead}")
 
 if __name__=="__main__": main()

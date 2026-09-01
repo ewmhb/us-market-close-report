@@ -1,5 +1,4 @@
+site/
+work/
 __pycache__/
 *.pyc
-work/
-site/
-

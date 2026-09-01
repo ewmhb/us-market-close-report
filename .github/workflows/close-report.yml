@@ -52,6 +52,15 @@ jobs:
         if: github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit == 'true'
         run: echo "The US close report was already deployed successfully for this market date."
 
+      - name: Restore latest successful news cache
+        if: github.event_name != 'schedule' || steps.sent_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: work/news-cache.json
+          key: us-close-report-news-${{ github.run_id }}
+          restore-keys: |
+            us-close-report-news-
+
       - uses: actions/setup-python@v5
         if: github.event_name != 'schedule' || steps.sent_cache.outputs.cache-hit != 'true'
         with:
@@ -90,6 +99,12 @@ jobs:
           echo "summary=$summary" >> "$GITHUB_OUTPUT"
       - uses: actions/configure-pages@v5
         if: steps.trading_day.outputs.is_open == 'true'
+      - name: Save latest successful news cache
+        if: steps.trading_day.outputs.is_open == 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: work/news-cache.json
+          key: us-close-report-news-${{ github.run_id }}
       - uses: actions/upload-pages-artifact@v3
         if: steps.trading_day.outputs.is_open == 'true'
         with:
