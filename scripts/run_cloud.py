@@ -33,6 +33,7 @@ def main() -> None:
     report_bucket_name = os.environ["REPORT_BUCKET"]
     state_bucket_name = os.environ["STATE_BUCKET"]
     now = datetime.now(NEW_YORK)
+    test_send = os.getenv("TEST_SEND", "false").lower() == "true"
     closed_date = latest_closed_market_date(now)
     if closed_date is None:
         print("최근 7일 안에 마감된 NYSE 거래일이 없어 종료합니다.")
@@ -44,9 +45,11 @@ def main() -> None:
     marker = state_bucket.blob(f"state/{REPORT_KIND}/{market_date}.sent")
     news_cache_blob = state_bucket.blob(f"state/{REPORT_KIND}/news-cache.json")
 
-    if marker.exists(client):
+    if marker.exists(client) and not test_send:
         print(f"{market_date} 리포트는 이미 발송되었습니다.")
         return
+    if test_send:
+        print("본인 전용 테스트 실행: 기존 발송 마커를 무시하고 새 마커는 기록하지 않습니다.")
     os.makedirs("work", exist_ok=True)
     if news_cache_blob.exists(client):
         news_cache_blob.download_to_filename("work/news-cache.json")
@@ -71,6 +74,8 @@ def main() -> None:
     for line in lines:
         print(line)
     summary = lines[-1]
+    if test_send:
+        summary = "[본인 전용 테스트] " + summary
 
     report_blob = report_bucket.blob(f"{REPORT_KIND}/index.html")
     report_blob.cache_control = "no-cache, max-age=0"
@@ -84,7 +89,8 @@ def main() -> None:
     env["REPORT_URL"] = report_url
     env["REPORT_SUMMARY"] = summary
     subprocess.run([sys.executable, "scripts/send_kakao.py"], check=True, env=env)
-    marker.upload_from_string(now.isoformat(), content_type="text/plain")
+    if not test_send:
+        marker.upload_from_string(now.isoformat(), content_type="text/plain")
     print(f"완료: {report_url}")
 
 
