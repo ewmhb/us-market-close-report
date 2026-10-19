@@ -1,19 +1,18 @@
-name: US market close report
+name: Archive US market close report
 
 on:
   workflow_dispatch:
     inputs:
       send_to_friends:
-        description: "Send this manual run to connected KakaoTalk friends"
+        description: "Send the existing GCS report link to Lee Sang-min"
         required: false
         type: boolean
         default: false
   schedule:
-    # Redundant weekday schedules. GitHub cron uses UTC.
-    # 07:00 / 07:20 / 07:40 KST (previous UTC calendar day)
-    - cron: "0 22 * * 0-4"
-    - cron: "20 22 * * 0-4"
-    - cron: "40 22 * * 0-4"
+    # GitHub cron is UTC. Fetch the GCS report after its scheduled production.
+    - cron: "10 22 * * 0-4"
+    - cron: "30 22 * * 0-4"
+    - cron: "50 22 * * 0-4"
 
 permissions:
   contents: write
@@ -21,12 +20,11 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
-  # A delayed primary schedule must not be cancelled by a backup schedule.
+  group: us-pages
   cancel-in-progress: false
 
 jobs:
-  report:
+  archive:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -35,115 +33,88 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Resolve US market date
-        if: github.event_name == 'schedule'
         id: market_date
         shell: bash
         run: echo "date=$(TZ=America/New_York date +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Restore today's successful-run marker
-        if: github.event_name == 'schedule'
+      - name: Restore today's notification marker
         id: sent_cache
         uses: actions/cache@v4
         with:
           path: work/sent-marker
           key: us-close-report-sent-${{ steps.market_date.outputs.date }}
 
-      - name: Skip duplicate scheduled run
-        if: github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit == 'true'
-        run: echo "The US close report was already deployed successfully for this market date."
-
-      - name: Restore latest successful news cache
-        if: github.event_name != 'schedule' || steps.sent_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: work/news-cache.json
-          key: us-close-report-news-${{ github.run_id }}
-          restore-keys: |
-            us-close-report-news-
-
-      - uses: actions/setup-python@v5
-        if: github.event_name != 'schedule' || steps.sent_cache.outputs.cache-hit != 'true'
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        if: github.event_name != 'schedule' || steps.sent_cache.outputs.cache-hit != 'true'
-        run: pip install -r requirements.txt
-
-      - name: Check US trading day
-        if: github.event_name != 'schedule' || steps.sent_cache.outputs.cache-hit != 'true'
-        id: trading_day
+      - name: Copy the GCS report without regenerating it
+        id: archive
         shell: bash
+        env:
+          REPORT_URL: https://storage.googleapis.com/hip-girder-355005-market-reports/us/index.html
         run: |
-          python - <<'PY'
-          import os
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-          import pandas_market_calendars as mcal
-          if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
-              is_open=True; reason="manual test run"
-          else:
-              market_date=datetime.now(ZoneInfo("America/New_York")).date()
-              schedule=mcal.get_calendar("NYSE").schedule(start_date=market_date,end_date=market_date)
-              is_open=not schedule.empty; reason=f"NYSE trading date {market_date}"
-          with open(os.environ["GITHUB_OUTPUT"],"a",encoding="utf-8") as output: output.write(f"is_open={str(is_open).lower()}\n")
-          print(f"Trading-day check: {is_open} ({reason})")
-          PY
-      - id: generate
-        if: steps.trading_day.outputs.is_open == 'true'
-        shell: bash
-        run: |
-          set -o pipefail
-          summary=$(python scripts/generate_report.py | tail -n 1)
-          echo "summary=$summary" >> "$GITHUB_OUTPUT"
-      - name: Save dated report archive
-        if: steps.trading_day.outputs.is_open == 'true'
+          set -euo pipefail
+          report_date=$(TZ=America/New_York date +%F)
+          mkdir -p site/archive
+          curl --fail --location --retry 2 --retry-delay 5 "$REPORT_URL" -o "site/archive/$report_date.html"
+          test -s "site/archive/$report_date.html"
+          cp "site/archive/$report_date.html" site/index.html
+          {
+            echo '<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>미국 증시 마감 리포트 아카이브</title></head><body>'
+            echo '<h1>미국 증시 마감 리포트 아카이브</h1><ul>'
+            for file in $(find site/archive -maxdepth 1 -type f -name '????-??-??.html' -printf '%f\n' | sort -r); do
+              printf '<li><a href="%s">%s</a></li>\n' "$file" "${file%.html}"
+            done
+            echo '</ul></body></html>'
+          } > site/archive/index.html
+          echo "date=$report_date" >> "$GITHUB_OUTPUT"
+
+      - name: Save the copied report archive
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add site/archive
+          git add site/index.html site/archive
           if git diff --cached --quiet; then
             echo "No archive changes to commit."
           else
-            git commit -m "Archive report for $(TZ=Asia/Seoul date +%F)"
+            git commit -m "Archive GCS US report for ${{ steps.archive.outputs.date }}"
             git push
           fi
 
       - uses: actions/configure-pages@v5
-        if: steps.trading_day.outputs.is_open == 'true'
-      - name: Save latest successful news cache
-        if: steps.trading_day.outputs.is_open == 'true' && success()
-        uses: actions/cache/save@v4
-        with:
-          path: work/news-cache.json
-          key: us-close-report-news-${{ github.run_id }}
+
       - uses: actions/upload-pages-artifact@v3
-        if: steps.trading_day.outputs.is_open == 'true'
         with:
           path: site
+
       - name: Deploy GitHub Pages
-        if: steps.trading_day.outputs.is_open == 'true'
         id: deployment
         uses: actions/deploy-pages@v4
-      - name: Send KakaoTalk notification
-        if: steps.trading_day.outputs.is_open == 'true'
+
+      - uses: actions/setup-python@v5
+        if: (github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true') || inputs.send_to_friends == true
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install notification dependencies
+        if: (github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true') || inputs.send_to_friends == true
+        run: pip install -r requirements.txt
+
+      - name: Send the original GCS URL by KakaoTalk
+        if: (github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true') || inputs.send_to_friends == true
         env:
           KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
           KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
-          REPORT_URL: ${{ steps.deployment.outputs.page_url }}
-          REPORT_SUMMARY: ${{ steps.generate.outputs.summary }}
+          REPORT_URL: https://storage.googleapis.com/hip-girder-355005-market-reports/us/index.html
+          REPORT_SUMMARY: "미국 증시 마감 리포트 (${{ steps.archive.outputs.date }})"
           SEND_TO_FRIENDS: "true"
           KAKAO_FRIEND_NAMES: "이상민"
           KAKAO_EXPECTED_FRIEND_COUNT: "1"
         run: python scripts/send_kakao.py
 
-      - name: Mark today's scheduled run as successful
-        if: github.event_name == 'schedule' && steps.trading_day.outputs.is_open == 'true' && success()
+      - name: Mark today's notification as sent
+        if: github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true' && success()
         shell: bash
         run: |
           mkdir -p work/sent-marker
-          echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > work/sent-marker/sent.txt
-
+          echo "sent_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > work/sent-marker/sent.txt
