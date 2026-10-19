@@ -2,12 +2,6 @@ name: Archive US market close report
 
 on:
   workflow_dispatch:
-    inputs:
-      send_to_friends:
-        description: "Send the existing GCS report link to Lee Sang-min"
-        required: false
-        type: boolean
-        default: false
   schedule:
     # GitHub cron is UTC. Fetch the GCS report after its scheduled production.
     - cron: "10 22 * * 0-4"
@@ -31,18 +25,6 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve US market date
-        id: market_date
-        shell: bash
-        run: echo "date=$(TZ=America/New_York date +%Y%m%d)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore today's notification marker
-        id: sent_cache
-        uses: actions/cache@v4
-        with:
-          path: work/sent-marker
-          key: us-close-report-sent-${{ steps.market_date.outputs.date }}
 
       - name: Copy the GCS report without regenerating it
         id: archive
@@ -88,33 +70,3 @@ jobs:
       - name: Deploy GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-      - uses: actions/setup-python@v5
-        if: (github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true') || inputs.send_to_friends == true
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install notification dependencies
-        if: (github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true') || inputs.send_to_friends == true
-        run: pip install -r requirements.txt
-
-      - name: Send the original GCS URL by KakaoTalk
-        if: (github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true') || inputs.send_to_friends == true
-        env:
-          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
-          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
-          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
-          REPORT_URL: https://storage.googleapis.com/hip-girder-355005-market-reports/us/index.html
-          REPORT_SUMMARY: "미국 증시 마감 리포트 (${{ steps.archive.outputs.date }})"
-          SEND_TO_FRIENDS: "true"
-          KAKAO_FRIEND_NAMES: "이상민"
-          KAKAO_EXPECTED_FRIEND_COUNT: "1"
-        run: python scripts/send_kakao.py
-
-      - name: Mark today's notification as sent
-        if: github.event_name == 'schedule' && steps.sent_cache.outputs.cache-hit != 'true' && success()
-        shell: bash
-        run: |
-          mkdir -p work/sent-marker
-          echo "sent_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > work/sent-marker/sent.txt
