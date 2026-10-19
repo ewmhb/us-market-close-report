@@ -238,6 +238,24 @@ def render_news(items):
         out.append(f'<article class="news-item" data-news-category="{escape(item["category"])}"><div class="news-source"><strong>{escape(item["source"])}</strong><span>{stamp}</span><b class="news-category">{escape(item["label"])}</b></div><a class="news-title" href="{escape(item["link"])}" target="_blank" rel="noreferrer">{escape(item["title"])}</a><a class="news-open" href="{escape(item["link"])}" target="_blank" rel="noreferrer">↗</a></article>')
     return "".join(out)
 
+def save_archive(html, now, title):
+    archive_dir=OUT.parent/"archive"
+    archive_dir.mkdir(parents=True,exist_ok=True)
+    daily_path=archive_dir/f"{now:%Y-%m-%d}.html"
+    daily_path.write_text(html,encoding="utf-8")
+    entries=sorted(
+        (path for path in archive_dir.glob("*.html") if path.name!="index.html"),
+        key=lambda path:path.name,
+        reverse=True,
+    )
+    links="".join(
+        f'<li><a href="{escape(path.name)}">{escape(path.stem)}</a></li>'
+        for path in entries
+    )
+    index_html=f"""<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape(title)} 아카이브</title><style>body{{max-width:760px;margin:48px auto;padding:0 20px;font-family:system-ui,sans-serif;line-height:1.6;color:#18202a}}a{{color:#0866c6}}li{{margin:10px 0}}</style></head><body><h1>{escape(title)} 아카이브</h1><p>날짜별 장 마감 리포트 원문입니다.</p><ul>{links}</ul></body></html>"""
+    (archive_dir/"index.html").write_text(index_html,encoding="utf-8")
+
+
 def main():
     now=datetime.now(KST); soup=BeautifulSoup(TEMPLATE.read_text(encoding="utf-8"),"html.parser"); failures=[]; indices={}; series={}
     for label,ticker,key in [("S&P 500","^GSPC","spx"),("NASDAQ","^IXIC","nasdaq"),("DOW JONES","^DJI","dow")]:
@@ -276,6 +294,6 @@ def main():
     if news_quality["errors"]: failures.extend(news_quality["errors"])
     render_weekly_calendar(soup,now)
     soup.select_one("header .meta").string=now.strftime("%Y.%m.%d %H:%M KST")
-    OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(str(soup),encoding="utf-8"); print(f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). {lead}")
+    rendered=str(soup); OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(rendered,encoding="utf-8"); save_archive(rendered,now,"US Market Close Report"); print(f"미국 증시 마감: S&P 500 {sp[0]:,.2f} ({sp[1]:+.2f}%). {lead}")
 
 if __name__=="__main__": main()
