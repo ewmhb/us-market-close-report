@@ -121,7 +121,9 @@ jobs:
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
           REPORT_URL: ${{ steps.deployment.outputs.page_url }}
           REPORT_SUMMARY: ${{ steps.generate.outputs.summary }}
-          SEND_TO_FRIENDS: "false"
+          SEND_TO_FRIENDS: "true"
+          KAKAO_FRIEND_NAMES: "이상민"
+          KAKAO_EXPECTED_FRIEND_COUNT: "1"
         run: python scripts/send_kakao.py
 
       - name: Mark today's scheduled run as successful
